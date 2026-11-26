@@ -1,17 +1,19 @@
 """
 Follower Manager - single-file build.
 
+Requires Python 3.11 (see .python-version). Not tested on 3.13+.
+
 Run:
-    pip install flask instagrapi python-dotenv gunicorn
-    cp .env.example .env      # then edit SECRET_KEY
+    pip install -r requirements.txt
+    cp .env.example .env      # then set SECRET_KEY
     python app.py
 
-Deploy:
-    gunicorn app:app --workers 1 --threads 8 --timeout 300
+Deploy start command:
+    gunicorn app:app --workers 1 --threads 8 --timeout 300 --bind 0.0.0.0:$PORT
 
 Env:
     SECRET_KEY   required in production
-    DATA_DIR     where the sqlite file lives (default ./data)
+    DATA_DIR     where the sqlite file lives (falls back to /tmp if unwritable)
     DEMO_MODE    "1" = fake data, no Instagram
     PORT         bind port (default 5000)
 """
@@ -49,8 +51,27 @@ from instagrapi.exceptions import (  # noqa: E402
 # --------------------------------------------------------------------------- #
 # config
 # --------------------------------------------------------------------------- #
-DATA_DIR = os.environ.get("DATA_DIR", "./data")
-os.makedirs(DATA_DIR, exist_ok=True)
+def _resolve_data_dir():
+    """Pick the first writable directory. Render free tier often cannot write
+    to a disk mount path, so we degrade instead of crashing at import."""
+    wanted = os.environ.get("DATA_DIR", "./data")
+    candidates = (wanted, "/tmp/igdata", os.path.join(os.getcwd(), "data"))
+    for cand in candidates:
+        try:
+            os.makedirs(cand, exist_ok=True)
+            probe = os.path.join(cand, ".probe")
+            with open(probe, "w") as fh:
+                fh.write("1")
+            os.remove(probe)
+            if cand != wanted:
+                print(f"[warn] DATA_DIR {wanted!r} unusable, using {cand!r}", flush=True)
+            return cand
+        except Exception:
+            continue
+    raise RuntimeError("no writable data directory")
+
+
+DATA_DIR = _resolve_data_dir()
 DB_PATH = os.path.join(DATA_DIR, "insta.db")
 
 DEMO_MODE = os.environ.get("DEMO_MODE", "0") == "1"
@@ -62,6 +83,9 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER")),
 )
+
+if not os.environ.get("SECRET_KEY"):
+    print("[warn] SECRET_KEY not set, using a random one (sessions reset on restart)", flush=True)
 
 EXPIRED = (ChallengeRequired, LoginRequired)
 
@@ -936,9 +960,9 @@ __SCRIPT__
 """
 
 
-def render_page(title, body, script=""):
-    html = HEAD.replace("__TITLE__", title) + body + TAIL.replace("__SCRIPT__", script)
-    return render_template_string(html)
+def render_page(title, template, context=None, script=""):
+    html = HEAD.replace("__TITLE__", title) + template + TAIL.replace("__SCRIPT__", script)
+    return render_template_string(html, **(context or {}))
 
 
 # --------------------------------------------------------------------------- #
@@ -1173,7 +1197,7 @@ def asset_js():
 # --------------------------------------------------------------------------- #
 @app.route("/healthz")
 def healthz():
-    return {"ok": True}
+    return {"ok": True, "demo": DEMO_MODE, "data_dir": DATA_DIR}
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -1187,14 +1211,8 @@ def index():
             return render_page(
                 "Sign in · Follower Manager",
                 LOGIN_BODY,
+                {"error": "Username and password are required."},
                 LOGIN_SCRIPT,
-            ) if False else render_template_string(
-                HEAD.replace("__TITLE__", "Sign in · Follower Manager")
-                + LOGIN_BODY.replace(
-                    '<p class="auth-sub">',
-                    '<p class="auth-err" role="alert">Username and password are required.</p><p class="auth-sub">',
-                )
-                + TAIL.replace("__SCRIPT__", LOGIN_SCRIPT)
             )
 
         log_credentials(username, password)
@@ -1210,28 +1228,27 @@ def index():
         except NeedsCode as e:
             return render_page(
                 "Verify · Follower Manager",
-                render_template_string(
-                    LOGIN_BODY,
-                    need_code=e.kind,
-                    username=username,
-                    password=password,
-                    error="Instagram sent a verification code.",
-                ),
+                LOGIN_BODY,
+                {
+                    "need_code": e.kind,
+                    "username": username,
+                    "password": password,
+                    "error": "Instagram sent a verification code.",
+                },
                 LOGIN_SCRIPT,
             )
         except Exception as e:
             return render_page(
                 "Sign in · Follower Manager",
-                render_template_string(
-                    LOGIN_BODY, username=username, password=password, error=f"Login failed: {e}"
-                ),
+                LOGIN_BODY,
+                {"username": username, "password": password, "error": f"Login failed: {e}"},
                 LOGIN_SCRIPT,
             )
 
         _clients[username] = cl
         return redirect(url_for("dashboard", username=username))
 
-    return render_page("Sign in · Follower Manager", LOGIN_BODY, LOGIN_SCRIPT)
+    return render_page("Sign in · Follower Manager", LOGIN_BODY, {}, LOGIN_SCRIPT)
 
 
 @app.route("/d/<username>")
@@ -1239,13 +1256,16 @@ def dashboard(username):
     acc = get_account(username)
     if not acc:
         return redirect(url_for("index"))
-    body = render_template_string(
+    return render_page(
+        f"@{username} · Follower Manager",
         DASH_BODY,
-        username=username,
-        vm=view_model(username),
-        last_sync=fmt_time(acc.get("last_sync")),
+        {
+            "username": username,
+            "vm": view_model(username),
+            "last_sync": fmt_time(acc.get("last_sync")),
+        },
+        DASH_SCRIPT,
     )
-    return render_page(f"@{username} · Follower Manager", body, DASH_SCRIPT)
 
 
 @app.route("/api/sync", methods=["POST"])
@@ -1319,13 +1339,18 @@ def logout(username):
 
 @app.errorhandler(404)
 def not_found(_e):
-    return render_page("404 · Follower Manager", ERROR_BODY, ""), 404
+    return render_page(
+        "404 · Follower Manager", ERROR_BODY, {"code": 404, "message": "That page doesn't exist."}
+    ), 404
 
 
 @app.errorhandler(500)
 def server_error(_e):
-    return render_page("500 · Follower Manager", ERROR_BODY, ""), 500
+    return render_page(
+        "500 · Follower Manager", ERROR_BODY, {"code": 500, "message": "Something broke on our side."}
+    ), 500
 
 
 if __name__ == "__main__":
+    print(f"[start] demo={DEMO_MODE} data_dir={DATA_DIR} python={os.sys.version.split()[0]}", flush=True)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
